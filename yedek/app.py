@@ -1,0 +1,304 @@
+import streamlit as st
+from pypdf import PdfReader
+import re
+import os
+import random
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# ------------------------------------------------------------------
+#  PDF PARSING (Ayrıştırma) FONKSİYONU (Correct Answer Sonrası Filtrelenmiş)
+# ------------------------------------------------------------------
+def parse_aws_questions(pdf_content):
+    """
+    Bir PDF dosya içeriğini okur, metni birleştirir ve
+    Regex kullanarak ayrıştırıp doğru cevap sonrasını dahil etmeyen bir liste döndürür.
+    """
+    text = ""
+    try:
+        pdf_reader = PdfReader(pdf_content)
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        text += "\n" # Metnin sonuna bir yeni satır ekle
+    except Exception as e:
+        st.error(f"PDF read error: {e}")
+        return []
+
+    questions = []
+    
+    # --- YENİ REGEX KALIBI ---
+    # Bu kalıp, Correct Answer'dan sonraki hiçbir şeyi (açıklama vb.) yakalamaz.
+    pattern = re.compile(
+        r"^(\d+)\s*\)\s(.*?)" +         # Grup 1 (num), opsiyonel boşluk, ), boşluk, Grup 2 (Q Text)
+        r"(?=\n[A-Z]\.)" +              # Anchor: Şıkların başladığı yer (\nA.)
+        r"((?:(?!\nCorrect Answer:|\nExplanation:).)*)" + # Grup 3: Şıklar
+        # Correct Answer öncesi gelebilecek açıklamaları pas geçmek için opsiyonel grup
+        r"(?:\nExplanation:(?:(?!\nCorrect Answer:).)*)?" + 
+        r"\nCorrect Answer:\s*([A-Z]{1,5})" +  # Grup 4: Sadece doğru cevabın harfi/harfleri (Örn: A, B, AD)
+        r"(?=\n\d+\s*\)|$)",            # End Anchor
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    chunks = re.split(r'\n(?=\d+\s*\))', text)
+
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+            
+        match = pattern.search(chunk)
+        
+        if match:
+            # Sadece ihtiyacımız olan 4 grubu alıyoruz
+            q_num, q_text, options_block, correct_letter = match.groups()
+            
+            # Soru numarasını ve metnini birleştir
+            question = f"{q_num}) {q_text.strip()}"
+            
+            cleaned_options = []
+            option_pattern = re.compile(r"([A-Z])\.(.*?)(?=\n[A-Z]\.|$)", re.DOTALL | re.IGNORECASE)
+            
+            for opt_match in option_pattern.finditer(options_block.strip()):
+                opt_letter, opt_text = opt_match.groups()
+                opt_cleaned = re.sub(r'Most Voted', '', opt_text, flags=re.IGNORECASE).strip()
+                opt_final = re.sub(r'\s*\n\s*', ' ', opt_cleaned).strip()
+                cleaned_options.append(f"{opt_letter}. {opt_final}")
+
+            correct_answer_full_text = ""
+            correct_letter = correct_letter.strip()
+            
+            # Doğru cevabın tam metnini bul (Örn: "A. Option Text")
+            first_correct_letter = correct_letter[0]
+            for opt in cleaned_options:
+                if opt.strip().startswith(first_correct_letter + "."):
+                    correct_answer_full_text = opt
+                    break
+            
+            if not correct_answer_full_text:
+                correct_answer_full_text = correct_letter
+
+            q_data = {
+                'soru': question,
+                'siklar': cleaned_options,
+                'dogru_cevap': correct_answer_full_text
+            }
+            questions.append(q_data)
+        
+        else:
+            pass # Başarısız olanları sessizce atla
+
+    if not questions:
+        st.error("Hiç soru ayrıştırılamadı. Lütfen PDF formatını veya Regex kalıbını kontrol edin.")
+
+    return questions
+
+# ------------------------------------------------------------------
+#  Veritabanı ve Model Fonksiyonları
+# ------------------------------------------------------------------
+@st.cache_resource
+def get_embedding_model():
+    print("Embedding modeli yükleniyor...")
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    print("Embedding modeli yüklendi.")
+    return model
+
+@st.cache_resource
+def get_vector_db():
+    print("Vektör veritabanı başlatılıyor...")
+    client = chromadb.EphemeralClient() 
+    print("Vektör veritabanı başlatıldı.")
+    return client
+
+def setup_database(client, model, questions_list):
+    try:
+        collection = client.get_or_create_collection(name="aws_questions")
+    except Exception as e:
+        st.error(f"Vektör DB koleksiyonu oluşturulamadı: {e}")
+        return None
+
+    if collection.count() != len(questions_list):
+        print(f"Veritabanı {collection.count()} / {len(questions_list)} soru içeriyor. Yeniden indeksleniyor...")
+        if collection.count() > 0:
+            client.delete_collection(name="aws_questions")
+            collection = client.get_or_create_collection(name="aws_questions")
+        
+        documents_to_embed = []
+        metadatas_for_db = []
+        ids_for_db = []
+        
+        for i, q in enumerate(questions_list):
+            content = f"Question: {q['soru']}"
+            documents_to_embed.append(content)
+            metadatas_for_db.append({"original_index": i})
+            ids_for_db.append(f"q_{i}")
+
+        embeddings = model.encode(documents_to_embed)
+        
+        collection.add(
+            embeddings=embeddings.tolist(),
+            documents=documents_to_embed,
+            metadatas=metadatas_for_db,
+            ids=ids_for_db
+        )
+        print("İndeksleme tamamlandı.")
+    else:
+        print("Veritabanı zaten güncel. İndeksleme atlanıyor.")
+        
+    return collection
+
+@st.cache_data
+def load_and_parse_questions(pdf_path):
+    print("PDF ayrıştırılıyor...")
+    if not os.path.exists(pdf_path):
+        st.error(f"Hata: '{pdf_path}' yolunda PDF bulunamadı.")
+        return None
+    try:
+        with open(pdf_path, "rb") as f:
+            return parse_aws_questions(f)
+    except Exception as e:
+        st.error(f"PDF okuma hatası: {e}")
+        return None
+
+# ------------------------------------------------------------------
+#  Streamlit Arayüzü
+# ------------------------------------------------------------------
+
+st.title("AWS Semantic Quiz Bot 🧠☁️")
+
+# --- 1. Yükleme ve Kurulum ---
+model = get_embedding_model()
+client = get_vector_db()
+questions_list = load_and_parse_questions("data/aws_exam.pdf")
+
+if not questions_list:
+    st.error("PDF'ten hiç soru okunamadığı için uygulama durduruldu.")
+    st.stop()
+
+collection = setup_database(client, model, questions_list)
+if not collection:
+    st.error("Vektör veritabanı kurulamadığı için uygulama durduruldu.")
+    st.stop()
+
+# --- Oturum Durumu (Session State) ---
+if 'quiz_started' not in st.session_state:
+    st.session_state.quiz_started = False
+    st.session_state.questions_to_ask = []
+    st.session_state.num_to_ask = 0
+    st.session_state.current_question_index = 0
+    st.session_state.score = 0
+    st.session_state.user_answers = {}
+
+# Stage 1: Konu Seçme VEYA Rastgele
+if not st.session_state.quiz_started:
+    
+    st.info(f"{collection.count()} adet AWS sorusu indekslendi.")
+    
+    user_topic = st.text_input(
+        "Which topic do you want to be quizzed on? (Leave blank for random)", 
+        placeholder="e.g., S3 and storage"
+    )
+    
+    num_to_ask_input = st.number_input(
+        "How many questions?",
+        min_value=1,
+        max_value=50,
+        value=3
+    )
+    num_to_ask = int(num_to_ask_input)
+
+    if st.button("Start Quiz"):
+        
+        retrieved_questions = []
+        
+        if user_topic.strip():
+            with st.spinner(f"Finding the {num_to_ask} best questions about '{user_topic}'..."):
+                query_embedding = model.encode([user_topic])[0].tolist()
+                results = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=num_to_ask
+                )
+                for metadata in results['metadatas'][0]:
+                    idx = metadata['original_index']
+                    retrieved_questions.append(questions_list[idx])
+        
+        else:
+            with st.spinner(f"Selecting {num_to_ask} random questions..."):
+                num_available = len(questions_list)
+                actual_num_to_get = min(num_to_ask, num_available)
+                if actual_num_to_get > 0:
+                    retrieved_questions = random.sample(questions_list, actual_num_to_get)
+        
+        if not retrieved_questions:
+            st.warning("No questions found. Please check your topic or if the PDF was parsed correctly.")
+        else:
+            st.session_state.questions_to_ask = retrieved_questions
+            st.session_state.num_to_ask = len(retrieved_questions)
+            st.session_state.quiz_started = True
+            st.session_state.current_question_index = 0
+            st.session_state.score = 0
+            st.session_state.user_answers = {}
+            st.rerun()
+
+# Stage 2: Quiz'i Gösterme
+elif st.session_state.quiz_started and st.session_state.current_question_index < st.session_state.num_to_ask:
+    
+    idx = st.session_state.current_question_index
+    q = st.session_state.questions_to_ask[idx] 
+    
+    st.subheader(f"Question {idx + 1} / {st.session_state.num_to_ask}")
+    st.write(q.get('soru', 'Question text not found'))
+    
+    with st.form(key=f"form_q_{idx}"):
+        user_answer = st.radio(
+            "Select your answer:",
+            q.get('siklar', []),
+            key=f"radio_q_{idx}",
+            index=None
+        )
+        submit_button = st.form_submit_button("Submit Answer")
+
+    if submit_button:
+        if user_answer is None:
+            st.warning("Please select an answer.")
+        else:
+            st.session_state.user_answers[idx] = user_answer
+            
+            correct_answer_text = q.get('dogru_cevap', 'Z').strip()
+            user_answer_prefix = user_answer.strip()[0]
+            
+            # Cevap 'A' veya 'AD' gibi sadece harfse
+            if len(correct_answer_text) <= 5: 
+                 correct_answer_prefix = correct_answer_text
+            # Cevap 'A. ...' gibi tam metinse
+            else:
+                 correct_answer_prefix = correct_answer_text[0]
+
+            # Kullanıcının cevabının ilk harfinin, doğru cevabın harfleri içinde olup olmadığını kontrol et
+            if user_answer_prefix in correct_answer_prefix:
+                st.success("Correct! 🎉")
+                st.session_state.score += 1
+            else:
+                st.error(f"Incorrect. The correct answer was: {q.get('dogru_cevap', 'N/A')}")
+            
+            st.session_state.current_question_index += 1
+            
+            if st.session_state.current_question_index < st.session_state.num_to_ask:
+                st.button("Next Question")
+            else:
+                st.button("View Results")
+
+# Stage 3: Sonuç Ekranı
+elif st.session_state.quiz_started and st.session_state.current_question_index >= st.session_state.num_to_ask:
+    st.balloons()
+    st.header("Quiz Finished!")
+    st.write(f"You answered {st.session_state.score} out of {st.session_state.num_to_ask} questions correctly.")
+    
+    if st.button("Start Over"):
+        st.session_state.quiz_started = False
+        st.session_state.questions_to_ask = []
+        st.session_state.num_to_ask = 0
+        st.session_state.current_question_index = 0
+        st.session_state.score = 0
+        st.session_state.user_answers = {}
+        st.rerun()
